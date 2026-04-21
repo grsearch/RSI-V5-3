@@ -1,6 +1,91 @@
 # CHANGELOG — RSI-V5-2 修复
 
-## V7 修复(本次)— EMA99 过滤器静默失效(严重 bug)
+## V5-4 修复(本次)— 日志系统失效 + RSI 虚假触发 + 同根K线买卖
+
+### 现象(4张图总结)
+- 图1:"RSI 最高 87" 但程序没卖出,过一会儿用 "RSI下穿70 RT:73.2→67.8" 卖出。K线图上RSI明显没到80也没到70
+- 图2:"RSI恐慌 88.9,88.9>80" 卖出,但图表上RSI根本没到80
+- 图3:第一个S点同上,第二个S点"买入与卖出在同一根K线"
+- 图4:"RSI下穿70 RT:72.5→68.5" 卖出,但实际RSI也没到70
+- 另外:图1、2所有诊断日志里 `getOHLCV %s type=%s 拉取 %d 根` 的 `%s`/`%d` 原样显示
+
+### 根本原因(7 个关联 bug)
+
+#### ① Winston logger 默认不支持 `%s`/`%d`/`%.Nf` 插值
+
+winston 3.x 的默认 format 不支持 printf 风格的参数插值。代码里大量 `logger.info('x %s %d', a, b)` 调用都被原样输出 `"x %s %d"`,所以之前所有诊断命令都没法读到真实数字。
+
+#### ② sanity check 阈值 10% 对 Pump.fun 过严
+
+V6 的 `_sanitizeHistoricalCandles` 把"相邻K线跳跃 >10%"当成异常,但 Pump.fun 低流动性币单根 5 分钟 K 线涨跌 10% 是常态,导致合法历史 K 线被大量丢弃。
+
+#### ③ `EMA_STRICT_MIN_BARS=30` 让新币无法买入
+
+Birdeye 对 Pump.fun 低流动性新币普遍只返回 ~25 根 K 线,永远无法满足 30 根阈值,前端显示"K线 24"的币全部被拒买。
+
+#### ④ 量能萎缩卖出误触发严重
+
+`VOL_ENABLED` 同时控制买入和卖出。Pump.fun 币买入瞬间量能爆发后自然回落,频繁触发萎缩出场。
+
+#### ⑤ 买入与卖出在同一根K线
+
+买入价是那根 K 线偏高位时,价格立即回落 >20% 触发固定止损,结果同一根 K 线上同时出现 B/S 两个标记。
+
+#### ⑥ 实时 stepRSI 在 K 线内波动剧烈时算出虚假高值
+
+stepRSI 基于"当前价格"逐 tick 推算 RSI。Pump.fun 币价格波动大,单个 tick 偏离均值 3% 就会让 stepRSI 从 60 飚到 72,下个 tick 又变回 60,触发虚假的"RSI 下穿 70"(对应图1/图4)。
+
+#### ⑦ 历史 K 线拼接处污染整个 rsiArray
+
+sanity check 后残留的历史 K 线仍在 RSI 数组里制造虚高值。`rsiArray[len-1]`、`rsiArray[len-2]` 连续 >80 看似合法 PANIC 触发条件,但价格实际根本没涨(对应图2/图3 第一个S)。
+
+### 🔧 本次修复
+
+#### `src/logger.js`(重写)
+自定义 splat 格式器,支持 `%s %d %i %f %j %x %%` 以及精度 `%.Nf`/`%.Nd` 和符号 `%+.Nf`。代码里所有现有调用无需改动。
+
+#### `src/monitor.js`
+1. 放宽 `_sanitizeHistoricalCandles`:`0.10` → `HIST_JUMP_MAX`(默认 `0.30`);hi-lo 阈值 `0.50` → `HIST_HILOW_MAX`(默认 `0.80`)
+2. `_poll` 内部二次 check 和止损轮询里的拼接 check 全部统一使用 `HIST_JUMP_MAX`
+3. `_doSell` 入口加同根K线禁卖保护:`_buyCandleTs === curCandleTs` 时拒绝卖出(包括止损)。`FORCED_EXIT` 可通过 `opts.force=true` 绕过
+4. WS tick `_checkRealtimeRsiSell` 和轮询 RT 下穿触发加已收盘 RSI ≥ `RSI_RT_CONFIRM_MIN`(默认 65)二次确认
+5. 轮询 RSI_PANIC 加价格真实性检查:最新收盘价相对最近 20 根均价必须 ≥ `RSI_PANIC_PRICE_MIN_RISE`(默认 +3%)
+
+#### `src/rsi.js`
+1. `EMA_STRICT_MIN_BARS` 默认 `30` → `20`
+2. 新增 `VOL_EXIT_ENABLED` 独立开关(默认 `false`)关闭量能萎缩卖出
+3. `evaluateSignal` 里的 RSI_PANIC 同样加价格真实性检查
+4. `evaluateSignal` 里的 RSI_CROSS_DOWN_70 同样加已收盘 RSI ≥ 65 二次确认
+
+#### `.env.example`
+文档化所有新增的 env vars
+
+### 📋 新增环境变量
+
+```bash
+# Sanity check 阈值(V5-4 比 V6 更宽松)
+HIST_JUMP_MAX=0.30              # 相邻K线跳跃阈值
+HIST_HILOW_MAX=0.80             # 单根K线 high-low 阈值
+
+# 量能萎缩卖出独立开关
+VOL_EXIT_ENABLED=false
+
+# RSI 二次确认
+EMA_STRICT_MIN_BARS=20          # 从 30 降到 20
+RSI_RT_CONFIRM_MIN=65           # 实时 RSI 下穿 70 要求已收盘RSI ≥ 此值
+RSI_PANIC_PRICE_MIN_RISE=0.03   # RSI_PANIC 需价格实际上涨此比例以上(相对近20根均价)
+```
+
+### 🆕 部署后日志提示
+
+- `🛡 %s 同根K线买入保护,跳过卖出 | 原因: %s` — 禁止同根K线卖出
+- `🛡 %s WS RSI下穿忽略(stepRSI噪声) RT:%.1f→%.1f 但已收盘RSI=%s<%d` — 拦下 stepRSI 噪声
+- `🛡 %s RSI=%.1f>%d 但价格仅%+.1f%%<%d%%,判定为脏数据,跳过恐慌` — 拦下 rsiArray 污染导致的虚假 PANIC
+- 原有卖出日志增加已收盘 RSI 字段,便于诊断:`RSI 72.1→68.9 (已收盘68.0)`
+
+---
+
+## V7 修复 — EMA99 过滤器静默失效(严重 bug)
 
 ### 现象
 

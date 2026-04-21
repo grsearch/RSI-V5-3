@@ -21,6 +21,10 @@ const KLINE_SEC    = parseInt(process.env.KLINE_INTERVAL_SEC || '300', 10);
 
 // 量能参数
 const VOL_ENABLED         = (process.env.VOL_ENABLED || 'true') === 'true';
+// ★ V5-4: 量能萎缩卖出独立开关（默认关闭）
+//   原逻辑:跟随 VOL_ENABLED,但买入/卖出应该分开控制
+//   默认关闭 —— Pump.fun 新币量能本就不稳定,萎缩误触发严重
+const VOL_EXIT_ENABLED    = (process.env.VOL_EXIT_ENABLED || 'false') === 'true';
 const VOL_BUY_MULT        = parseFloat(process.env.VOL_BUY_MULT          || '1.2');
 const VOL_SELL_MULT       = parseFloat(process.env.VOL_SELL_MULT         || '999'); // sellVol >= N × buyVol 触发卖出（默认999=禁用）
 const VOL_MIN_TOTAL       = parseFloat(process.env.VOL_MIN_TOTAL         || '5');   // 最低总成交量(SOL)，买入窗口内 buyVol+sellVol >= N SOL
@@ -165,6 +169,8 @@ function checkBuyVolume(closedCandles, currentCandle) {
 }
 
 function checkVolumeDecay(closedCandles, tokenState) {
+  // ★ V5-4: 量能萎缩卖出默认关闭（独立开关 VOL_EXIT_ENABLED）
+  if (!VOL_EXIT_ENABLED) return { shouldExit: false, reason: 'VOL_EXIT_DISABLED' };
   if (!VOL_ENABLED) return { shouldExit: false, reason: '' };
   if (closedCandles.length < VOL_EXIT_LOOKBACK + VOL_EXIT_CONSECUTIVE) {
     return { shouldExit: false, reason: 'INSUFFICIENT_DATA' };
@@ -316,17 +322,34 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
     //    导致在RSI实际只有40-60的时候误触恐慌卖出
     //    ★ V6: 要求连续2根K线都>RSI_PANIC才触发，避免单根K线异常值(如历史K线
     //    拼接处价格跳跃导致RSI算出95+)误触发
+    //    ★ V5-4: 加价格真实性验证 —— 历史K线拼接处可能造成 rsiArray 整段虚高(图2/3)
+    //    如果价格根本没真正上涨,RSI 显示 >80 必然是数据污染
     if (lastClosedRsi > RSI_PANIC) {
       const prevClosedRsi = rsiArray[len - 2];
       const panicConfirmed = Number.isFinite(prevClosedRsi) && prevClosedRsi > RSI_PANIC;
-      if (panicConfirmed) {
+
+      // V5-4: 价格真实性检查 —— 最新收盘价 vs 最近 20 根K线均价
+      const priceSanityBars = Math.min(20, len);
+      let avgRecent = 0;
+      for (let i = len - priceSanityBars; i < len; i++) avgRecent += closes[i];
+      avgRecent /= priceSanityBars;
+      const lastCloseVal = closes[len - 1];
+      const priceRise = avgRecent > 0 ? (lastCloseVal - avgRecent) / avgRecent : 0;
+      const RSI_PANIC_PRICE_MIN_RISE = parseFloat(process.env.RSI_PANIC_PRICE_MIN_RISE || '0.03');
+      const priceRealisticallyHigh = priceRise >= RSI_PANIC_PRICE_MIN_RISE;
+
+      if (panicConfirmed && priceRealisticallyHigh) {
         const lastPanicTs = tokenState._lastPanicSellTs ?? 0;
         if (nowMs - lastPanicTs >= 2000) {
           tokenState._lastPanicSellTs = nowMs;
           updateState();
           return { rsi: lastClosedRsi, prevRsi, signal: 'SELL',
-                   reason: `RSI_PANIC(${prevClosedRsi.toFixed(1)},${lastClosedRsi.toFixed(1)}>${RSI_PANIC})`, volume: volumeInfo };
+                   reason: `RSI_PANIC(${prevClosedRsi.toFixed(1)},${lastClosedRsi.toFixed(1)}>${RSI_PANIC},+${(priceRise*100).toFixed(1)}%)`, volume: volumeInfo };
         }
+      } else if (panicConfirmed && !priceRealisticallyHigh) {
+        // 价格没真涨但 RSI 说 >80 → 历史K线数据污染,标记让下轮重建
+        tokenState._rsiDataTainted = true;
+        // 不卖,继续往下走其他检查
       }
       // 单根K线 RSI 异常高但前一根正常 → 很可能是数据不连续导致的虚假值,不触发
       //   (monitor 里会在拼接阶段发现价格跳跃并禁用历史K线,这里是第二道防线)
@@ -334,6 +357,7 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
 
     // 2. RSI 下穿 70
     //    ★ V6: 加 RSI 跳跃保护,防止历史/实时K线拼接处脏数据导致的假下穿
+    //    ★ V5-4: 加已收盘RSI二次确认,过滤stepRSI噪声触发
     if (prevRsi >= RSI_SELL && rsiRealtime < RSI_SELL && lastCandleTs !== lastSellCandle) {
       const rsiJump = Math.abs(prevRsi - rsiRealtime);
       if (rsiJump > 30) {
@@ -342,10 +366,16 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
         tokenState._rsiDataTainted = true;
         // 不触发卖出,跳过
       } else {
-        tokenState._lastSellCandle = lastCandleTs;
-        updateState();
-        return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
-                 reason: `RSI_CROSS_DOWN_70(${prevRsi.toFixed(1)}→${rsiRealtime.toFixed(1)})`, volume: volumeInfo };
+        // V5-4: 要求已收盘K线RSI >= RSI_RT_CONFIRM_MIN (默认65)
+        //   stepRSI 算出的 prevRsi>=70 如果不能被已收盘RSI佐证,就是K线内价格噪声
+        const RSI_RT_CONFIRM_MIN = parseFloat(process.env.RSI_RT_CONFIRM_MIN || '65');
+        if (Number.isFinite(lastClosedRsi) && lastClosedRsi >= RSI_RT_CONFIRM_MIN) {
+          tokenState._lastSellCandle = lastCandleTs;
+          updateState();
+          return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
+                   reason: `RSI_CROSS_DOWN_70(${prevRsi.toFixed(1)}→${rsiRealtime.toFixed(1)},K=${lastClosedRsi.toFixed(1)})`, volume: volumeInfo };
+        }
+        // 已收盘RSI不够高 → stepRSI噪声,不卖
       }
     }
 
@@ -373,12 +403,16 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
   // ★ RSI < 30（超卖区）+ buyVol >= 1.2 × sellVol
   if (!tokenState.inPosition) {
     if (rsiRealtime < RSI_BUY && lastCandleTs !== lastBuyCandle) {
-      // ★ EMA99 过滤：价格必须在 EMA99 下方才允许买入
+      // ── EMA99 过滤：价格必须在 EMA99 下方才允许买入 ──
       //   ★ V6: 修复 EMA99 过滤失效 bug
       //     - 以前: calcEMA 在 closes.length < 99 时返回 NaN,过滤直接被跳过,任何价位都能买
       //     - 现在: K线不足时 calcEMA 返回近似 EMA(基于可用K线),仍可过滤
       //     - EMA_STRICT_MIN_BARS 环境变量控制严格模式:K线少于此值拒绝买入(保守默认)
-      const EMA_STRICT_MIN_BARS = parseInt(process.env.EMA_STRICT_MIN_BARS || '30', 10);
+      //   ★ V5-4: 默认从 30 降到 20
+      //     - Birdeye 对 Pump.fun 低流动性新币常只返回 25 根 K 线,导致 30 的阈值永远无法满足
+      //     - 20 根 (5m×20 = 100 分钟) 已足够 EMA 近似值收敛到可用精度
+      //     - 仍可通过环境变量 EMA_STRICT_MIN_BARS 自定义
+      const EMA_STRICT_MIN_BARS = parseInt(process.env.EMA_STRICT_MIN_BARS || '20', 10);
       const ema99 = calcEMA(closes, EMA_PERIOD);
       if (closes.length < EMA_STRICT_MIN_BARS) {
         // K线太少,EMA99 完全不可信,保守拒买
