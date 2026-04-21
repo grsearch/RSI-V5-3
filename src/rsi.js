@@ -1,0 +1,569 @@
+'use strict';
+// src/rsi.js — RSI 计算 + 量能过滤 + BUY/SELL 信号逻辑 (V3)
+//
+// V3 修复：
+//   1. buildCandles 区分「价格 tick」和「链上交易 tick」
+//      - 价格 tick（来自 Birdeye WS/HTTP，USD 计价）→ 构成 OHLC
+//      - 链上 tick（来自 Helius WS，SOL 计价） → 只贡献 volume/buyVolume/sellVolume
+//      - 解决了 V2 中 SOL 价格和 USD 价格混入同一数组导致 RSI 错乱的致命 BUG
+//
+//   2. 止损检查独立于 K 线周期，每个 tick 都检查（快速止损）
+//
+// 策略：
+//   BUY : RSI(7) < 35（超卖区）+ totalVol ≥ 15 SOL + buyVol ≥ 1.2×sellVol
+//   SELL: RSI 下穿 70 / RSI > 80 / 止盈 / 止损 / 量能萎缩出场
+
+const RSI_PERIOD   = parseInt(process.env.RSI_PERIOD       || '7',  10);
+const RSI_BUY      = parseFloat(process.env.RSI_BUY_LEVEL  || '30');
+const RSI_SELL     = parseFloat(process.env.RSI_SELL_LEVEL  || '70');
+const RSI_PANIC    = parseFloat(process.env.RSI_PANIC_LEVEL || '80');
+const KLINE_SEC    = parseInt(process.env.KLINE_INTERVAL_SEC || '300', 10);
+
+// 量能参数
+const VOL_ENABLED         = (process.env.VOL_ENABLED || 'true') === 'true';
+const VOL_BUY_MULT        = parseFloat(process.env.VOL_BUY_MULT          || '1.2');
+const VOL_SELL_MULT       = parseFloat(process.env.VOL_SELL_MULT         || '999'); // sellVol >= N × buyVol 触发卖出（默认999=禁用）
+const VOL_MIN_TOTAL       = parseFloat(process.env.VOL_MIN_TOTAL         || '5');   // 最低总成交量(SOL)，买入窗口内 buyVol+sellVol >= N SOL
+const VOL_WINDOW_SEC      = parseInt(process.env.VOL_WINDOW_SEC       || '300', 10);
+const VOL_EXIT_CONSECUTIVE = parseInt(process.env.VOL_EXIT_CONSECUTIVE || '3', 10);  // ★ 2→3 更严格
+const VOL_EXIT_RATIO      = parseFloat(process.env.VOL_EXIT_RATIO     || '0.3');    // ★ 1.0→0.3 真正萎缩才触发(低于均值30%)
+const VOL_EXIT_LOOKBACK   = parseInt(process.env.VOL_EXIT_LOOKBACK    || '6', 10);  // ★ 4→6 平均基线更稳
+const VOL_EXIT_MIN_HOLD_CANDLES = parseInt(process.env.VOL_EXIT_MIN_HOLD_CANDLES || '2', 10); // ★ 买入后至少持有N根K线才允许量能萎缩卖出
+const SKIP_FIRST_CANDLES  = parseInt(process.env.SKIP_FIRST_CANDLES   || '8', 10);
+
+// 止盈止损
+const TAKE_PROFIT_PCT = parseFloat(process.env.TAKE_PROFIT_PCT || '50');
+const STOP_LOSS_PCT   = parseFloat(process.env.STOP_LOSS_PCT   || '-20');
+
+// 移动止损（Trailing Stop）
+const TRAILING_STOP_ENABLED  = (process.env.TRAILING_STOP_ENABLED  || 'true') === 'true';
+const TRAILING_STOP_ACTIVATE = parseFloat(process.env.TRAILING_STOP_ACTIVATE || '30'); // 上涨 30% 后激活
+const TRAILING_STOP_PCT      = parseFloat(process.env.TRAILING_STOP_PCT      || '-20'); // 峰值回撤 20% 清仓
+
+// EMA99 买入过滤：价格必须在 EMA99 下方才允许买入
+const EMA_PERIOD = parseInt(process.env.EMA_PERIOD || '99', 10);
+
+function calcEMA(closes, period) {
+  if (closes.length < period) return NaN;
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+// ── Wilder RSI 计算 ────────────────────────────────────────────────
+
+function calcRSIWithState(closes, period = RSI_PERIOD) {
+  const rsiArray = new Array(closes.length).fill(NaN);
+  if (closes.length < period + 1) return { rsiArray, avgGain: NaN, avgLoss: NaN };
+
+  let gainSum = 0, lossSum = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gainSum += diff;
+    else lossSum += Math.abs(diff);
+  }
+  let avgGain = gainSum / period;
+  let avgLoss = lossSum / period;
+  rsiArray[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? Math.abs(diff) : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    rsiArray[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+
+  return { rsiArray, avgGain, avgLoss };
+}
+
+function stepRSI(avgGain, avgLoss, lastClose, newPrice, period = RSI_PERIOD) {
+  if (!Number.isFinite(avgGain) || !Number.isFinite(avgLoss)) return NaN;
+  const diff = newPrice - lastClose;
+  const gain = diff > 0 ? diff : 0;
+  const loss = diff < 0 ? Math.abs(diff) : 0;
+  const ag = (avgGain * (period - 1) + gain) / period;
+  const al = (avgLoss * (period - 1) + loss) / period;
+  return al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+}
+
+// ── 量能检测 ─────────────────────────────────────────────────────
+
+function checkBuyVolume(closedCandles, currentCandle) {
+  if (!VOL_ENABLED) return { pass: true, reason: 'VOL_DISABLED', buyVol: 0, sellVol: 0, ratio: 0 };
+
+  const windowBars = Math.max(1, Math.ceil(VOL_WINDOW_SEC / KLINE_SEC));
+
+  const allCandles = [...closedCandles];
+  if (currentCandle) allCandles.push(currentCandle);
+
+  if (allCandles.length < windowBars) {
+    return { pass: false, reason: 'VOL_INSUFFICIENT_DATA', buyVol: 0, sellVol: 0, ratio: 0 };
+  }
+
+  // ★ 用 calcVolumeInfo 计算量能（自动扩展窗口，跳过历史K线）
+  const _volInfo = calcVolumeInfo(allCandles, windowBars, KLINE_SEC);
+  let totalBuy = _volInfo.buyVol, totalSell = _volInfo.sellVol;
+
+  const total = totalBuy + totalSell;
+  const ratio = total > 0 ? totalBuy / total : 0;
+
+  // 没有链上方向数据 → 拒绝买入
+  if (total === 0) {
+    return { pass: false, reason: 'VOL_NO_DIRECTION_DATA', buyVol: 0, sellVol: 0, ratio: 0 };
+  }
+
+  // ★ 最低总成交量门槛
+  if (total < VOL_MIN_TOTAL) {
+    const mult = totalSell > 0 ? (totalBuy / totalSell).toFixed(1) : '∞';
+    return {
+      pass: false,
+      reason: `VOL_TOO_LOW(${total.toFixed(1)}<${VOL_MIN_TOTAL}SOL,${mult}x,${VOL_WINDOW_SEC}s)`,
+      buyVol: totalBuy, sellVol: totalSell, ratio,
+    };
+  }
+
+  // 核心条件：buyVol >= VOL_BUY_MULT × sellVol
+  if (totalBuy >= totalSell * VOL_BUY_MULT) {
+    const mult = totalSell > 0 ? (totalBuy / totalSell).toFixed(1) : '∞';
+    return {
+      pass: true,
+      reason: `BUY≥${VOL_BUY_MULT}xSELL(${totalBuy.toFixed(2)}>=${(totalSell*VOL_BUY_MULT).toFixed(2)},${mult}x,${(ratio*100).toFixed(0)}%,${VOL_WINDOW_SEC}s)`,
+      buyVol: totalBuy, sellVol: totalSell, ratio,
+    };
+  }
+
+  const mult = totalSell > 0 ? (totalBuy / totalSell).toFixed(1) : '0';
+  return {
+    pass: false,
+    reason: `BUY<${VOL_BUY_MULT}xSELL(buy=${totalBuy.toFixed(2)},sell=${totalSell.toFixed(2)},${mult}x,${VOL_WINDOW_SEC}s)`,
+    buyVol: totalBuy, sellVol: totalSell, ratio,
+  };
+}
+
+function checkVolumeDecay(closedCandles, tokenState) {
+  if (!VOL_ENABLED) return { shouldExit: false, reason: '' };
+  if (closedCandles.length < VOL_EXIT_LOOKBACK + VOL_EXIT_CONSECUTIVE) {
+    return { shouldExit: false, reason: 'INSUFFICIENT_DATA' };
+  }
+
+  // ★ FIX: 买入后保护期 —— 至少持有 VOL_EXIT_MIN_HOLD_CANDLES 根K线才允许量能萎缩出场
+  //   避免买入后紧接着的那根K线就触发"萎缩"(买入瞬间通常是量能爆发顶点,后续自然会回落)
+  const buyCandleTs = tokenState._buyCandleTs;
+  if (Number.isFinite(buyCandleTs) && buyCandleTs > 0) {
+    const lastCandleTs = closedCandles[closedCandles.length - 1].openTime;
+    // 计算从买入K线到现在过了几根K线
+    const klineSecMs = (parseInt(process.env.KLINE_INTERVAL_SEC || '300', 10)) * 1000;
+    const holdCandles = Math.floor((lastCandleTs - buyCandleTs) / klineSecMs);
+    if (holdCandles < VOL_EXIT_MIN_HOLD_CANDLES) {
+      return { shouldExit: false, reason: `HOLD_PROTECTION(${holdCandles}/${VOL_EXIT_MIN_HOLD_CANDLES})` };
+    }
+  }
+
+  const avgEnd = closedCandles.length - VOL_EXIT_CONSECUTIVE;
+  const avgStart = Math.max(0, avgEnd - VOL_EXIT_LOOKBACK);
+  const avgCandles = closedCandles.slice(avgStart, avgEnd);
+  const avgVol = avgCandles.reduce((s, c) => s + (c.volume || 0), 0) / avgCandles.length;
+
+  if (avgVol <= 0) return { shouldExit: false, reason: 'AVG_VOL_ZERO' };
+
+  const recentCandles = closedCandles.slice(-VOL_EXIT_CONSECUTIVE);
+  const allDecayed = recentCandles.every(c => (c.volume || 0) < avgVol * VOL_EXIT_RATIO);
+
+  if (allDecayed) {
+    const recentVols = recentCandles.map(c => (c.volume || 0).toFixed(0)).join(',');
+    return {
+      shouldExit: true,
+      reason: `VOL_DECAY(recent=[${recentVols}]<avg=${avgVol.toFixed(0)}×${VOL_EXIT_RATIO})`,
+    };
+  }
+
+  return { shouldExit: false, reason: '' };
+}
+
+// ── 快速止损检查（独立于 K 线，每个 tick 调用） ──────────────────
+
+/**
+ * 快速止损/止盈检查，不依赖 RSI，直接看价格偏离
+ * @returns {{ shouldExit: boolean, reason: string }}
+ */
+function checkStopLoss(currentPrice, tokenState) {
+  if (!tokenState.inPosition || !tokenState.position?.entryPriceUsd) {
+    return { shouldExit: false, reason: '' };
+  }
+
+  const entryPrice = tokenState.position.entryPriceUsd;
+  const pnl = (currentPrice - entryPrice) / entryPrice * 100;
+
+  // ── 移动止损（Trailing Stop）────────────────────────────────────
+  if (TRAILING_STOP_ENABLED && tokenState.position) {
+    // 每个 tick 更新峰值价格
+    if (!tokenState.position._peakPrice || currentPrice > tokenState.position._peakPrice) {
+      tokenState.position._peakPrice = currentPrice;
+    }
+    const peakPrice = tokenState.position._peakPrice;
+    const peakPnl   = (peakPrice - entryPrice) / entryPrice * 100;
+
+    // 上涨达到激活线后，从峰值回撤超过阈值则清仓
+    if (peakPnl >= TRAILING_STOP_ACTIVATE) {
+      const dropFromPeak = (currentPrice - peakPrice) / peakPrice * 100;
+      if (dropFromPeak <= TRAILING_STOP_PCT) {
+        return {
+          shouldExit: true,
+          reason: `TRAILING_STOP(峰值+${peakPnl.toFixed(1)}%,回撤${dropFromPeak.toFixed(1)}%≤${TRAILING_STOP_PCT}%)`
+        };
+      }
+    }
+  }
+
+  // ── 固定止盈 / 固定止损 ───────────────────────────────────────
+  if (pnl >= TAKE_PROFIT_PCT) {
+    return { shouldExit: true, reason: `TAKE_PROFIT(+${pnl.toFixed(1)}%≥${TAKE_PROFIT_PCT}%)` };
+  }
+  if (pnl <= STOP_LOSS_PCT) {
+    return { shouldExit: true, reason: `STOP_LOSS(${pnl.toFixed(1)}%≤${STOP_LOSS_PCT}%)` };
+  }
+
+  return { shouldExit: false, reason: '', pnl };
+}
+
+// ── 主信号函数 ─────────────────────────────────────────────────────
+
+function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
+  // ★ FIX: 先计算 volumeInfo，这样即便 RSI 预热/数据不足，前端也能显示量能
+  const windowBars = Math.max(1, Math.ceil(VOL_WINDOW_SEC / KLINE_SEC));
+  const _rawForVol = rawCandles || closedCandles;
+  const volumeInfo = calcVolumeInfo(_rawForVol, windowBars, KLINE_SEC);
+
+  const MIN_CANDLES = RSI_PERIOD + 2;
+  if (!closedCandles || closedCandles.length < MIN_CANDLES) {
+    return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'warming_up', volume: volumeInfo };
+  }
+
+  if (closedCandles.length < SKIP_FIRST_CANDLES) {
+    return { rsi: NaN, prevRsi: NaN, signal: null, reason: `skip_first(${closedCandles.length}/${SKIP_FIRST_CANDLES})`, volume: volumeInfo };
+  }
+
+  const closes = closedCandles.map(c => c.close);
+  const len    = closes.length;
+
+  const { rsiArray, avgGain, avgLoss } = calcRSIWithState(closes, RSI_PERIOD);
+  const lastClosedRsi = rsiArray[len - 1];
+  const lastClose     = closes[len - 1];
+
+  // ★ 缓存到 tokenState，供 WS tick 快速下穿检测使用（避免重复计算）
+  const lastCandleTs = closedCandles[len - 1].openTime;
+  if (lastCandleTs !== tokenState._rsiLastCandleTs) {
+    tokenState._rsiAvgGain      = avgGain;
+    tokenState._rsiAvgLoss      = avgLoss;
+    tokenState._rsiLastClose    = lastClose;
+    tokenState._rsiLastCandleTs = lastCandleTs;
+  }
+
+  const rsiRealtime = stepRSI(avgGain, avgLoss, lastClose, realtimePrice, RSI_PERIOD);
+
+  if (!Number.isFinite(lastClosedRsi) || !Number.isFinite(rsiRealtime)) {
+    return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'rsi_nan', volume: volumeInfo,
+             avgGain: NaN, avgLoss: NaN, lastClose: NaN };
+  }
+
+  const nowMs          = Date.now();
+  // lastCandleTs 已在上方 RSI 缓存块里声明，直接复用
+  const lastBuyCandle  = tokenState._lastBuyCandle  ?? -1;
+  const lastSellCandle = tokenState._lastSellCandle ?? -1;
+
+  const prevRsiRaw = tokenState._prevRsiRealtime;
+  const prevTs     = tokenState._prevRsiTs ?? 0;
+  const isStale    = !Number.isFinite(prevRsiRaw) || (nowMs - prevTs) > 10000;
+  const prevRsi    = isStale ? lastClosedRsi : prevRsiRaw;
+
+  const updateState = () => {
+    tokenState._prevRsiRealtime = rsiRealtime;
+    tokenState._prevRsiTs       = nowMs;
+  };
+
+  // 量能信息已在函数开头计算，这里直接使用 volumeInfo / windowBars / _rawForVol
+
+  // ── SELL 优先（持仓中） ────────────────────────────────────────
+  if (tokenState.inPosition) {
+
+    // 1. RSI > 80 恐慌卖
+    //    ★ V5: 只信任已收盘K线RSI（lastClosedRsi），不用 stepRSI 实时估算
+    //    stepRSI 在K线内波动剧烈时容易算出虚假高值（如95.7），
+    //    导致在RSI实际只有40-60的时候误触恐慌卖出
+    //    ★ V6: 要求连续2根K线都>RSI_PANIC才触发，避免单根K线异常值(如历史K线
+    //    拼接处价格跳跃导致RSI算出95+)误触发
+    if (lastClosedRsi > RSI_PANIC) {
+      const prevClosedRsi = rsiArray[len - 2];
+      const panicConfirmed = Number.isFinite(prevClosedRsi) && prevClosedRsi > RSI_PANIC;
+      if (panicConfirmed) {
+        const lastPanicTs = tokenState._lastPanicSellTs ?? 0;
+        if (nowMs - lastPanicTs >= 2000) {
+          tokenState._lastPanicSellTs = nowMs;
+          updateState();
+          return { rsi: lastClosedRsi, prevRsi, signal: 'SELL',
+                   reason: `RSI_PANIC(${prevClosedRsi.toFixed(1)},${lastClosedRsi.toFixed(1)}>${RSI_PANIC})`, volume: volumeInfo };
+        }
+      }
+      // 单根K线 RSI 异常高但前一根正常 → 很可能是数据不连续导致的虚假值,不触发
+      //   (monitor 里会在拼接阶段发现价格跳跃并禁用历史K线,这里是第二道防线)
+    }
+
+    // 2. RSI 下穿 70
+    if (prevRsi >= RSI_SELL && rsiRealtime < RSI_SELL && lastCandleTs !== lastSellCandle) {
+      tokenState._lastSellCandle = lastCandleTs;
+      updateState();
+      return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
+               reason: `RSI_CROSS_DOWN_70(${prevRsi.toFixed(1)}→${rsiRealtime.toFixed(1)})`, volume: volumeInfo };
+    }
+
+    // 3. 止盈 / 止损（也在 evaluateSignal 中保留，双重保险）
+    const sl = checkStopLoss(realtimePrice, tokenState);
+    if (sl.shouldExit) {
+      updateState();
+      return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
+               reason: sl.reason, volume: volumeInfo };
+    }
+
+    // 4. 卖压卖出 — 已彻底禁用
+    // if (VOL_ENABLED && winTotal > 0 && winSell >= winBuy * VOL_SELL_MULT ...) { ... }
+
+    // 5. 量能萎缩出场
+    const volDecay = checkVolumeDecay(closedCandles, tokenState);
+    if (volDecay.shouldExit) {
+      updateState();
+      return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
+               reason: volDecay.reason, volume: volumeInfo };
+    }
+  }
+
+  // ── BUY ────────────────────────────────────────────────────────
+  // ★ RSI < 30（超卖区）+ buyVol >= 1.2 × sellVol
+  if (!tokenState.inPosition) {
+    if (rsiRealtime < RSI_BUY && lastCandleTs !== lastBuyCandle) {
+      // ★ EMA99 过滤：价格必须在 EMA99 下方才允许买入
+      const ema99 = calcEMA(closes, EMA_PERIOD);
+      if (Number.isFinite(ema99) && realtimePrice >= ema99) {
+        updateState();
+        return { rsi: rsiRealtime, prevRsi, signal: null,
+                 reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)})`, volume: volumeInfo };
+      }
+
+      const volCheck = checkBuyVolume(_rawForVol, null); // 用原始K线（含量能）做量能判断
+      volumeInfo.buyVol   = volCheck.buyVol;
+      volumeInfo.sellVol  = volCheck.sellVol;
+      volumeInfo.buyRatio = volCheck.ratio;
+
+      if (volCheck.pass) {
+        // ★ 注意：不在此处标记 _lastBuyCandle，由 monitor._canBuy 通过冷却检查后再标记
+        // 这样冷却期内不会白白消耗K线槽位，冷却结束后第一根满足条件的K线即可买入
+        updateState();
+        return { rsi: rsiRealtime, prevRsi, signal: 'BUY',
+                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+EMA99OK+${volCheck.reason}`,
+                 volume: volumeInfo, candleTs: lastCandleTs };
+      }
+      // 量能不达标，不标记 lastBuyCandle，下根K线继续检查
+    }
+  }
+
+  updateState();
+  return { rsi: rsiRealtime, prevRsi, signal: null, reason: isStale ? 'rsi_rebase' : '', volume: volumeInfo };
+}
+
+// ── K线聚合（V3：分离价格 tick 和链上交易 tick） ─────────────────
+//
+// tick 格式（两种来源共存于同一数组，用 source 字段区分）：
+//
+//   价格 tick（Birdeye WS/HTTP）:
+//     { price: USD价格, ts, source: 'price' }
+//     → 构成 OHLC
+//
+//   链上交易 tick（Helius WS）:
+//     { price: 忽略(SOL计价), ts, solAmount, isBuy, source: 'chain' }
+//     → 只贡献 volume / buyVolume / sellVolume
+//     → 不参与 OHLC（单位不同！）
+//
+
+function buildCandles(ticks, intervalSec = KLINE_SEC) {
+  if (!ticks || ticks.length === 0) return { closed: [], current: null };
+
+  const intervalMs = intervalSec * 1000;
+  const candles    = [];
+  let current      = null;
+
+  for (const tick of ticks) {
+    const bucket = Math.floor(tick.ts / intervalMs) * intervalMs;
+
+    const isChainTick = tick.source === 'chain';
+
+    if (!current || current.openTime !== bucket) {
+      // 新 K 线
+      if (current) candles.push(current);
+
+      if (isChainTick) {
+        // 链上 tick 开始一根新K线，但没有价格数据
+        // 创建空价格K线，等下一个价格 tick 填入
+        current = {
+          openTime:   bucket,
+          closeTime:  bucket + intervalMs,
+          open:       null,    // 等待价格 tick 填入
+          high:       null,
+          low:        null,
+          close:      null,
+          volume:     tick.solAmount || 0,
+          buyVolume:  tick.isBuy  ? (tick.solAmount || 0) : 0,
+          sellVolume: !tick.isBuy ? (tick.solAmount || 0) : 0,
+          tickCount:  1,
+          priceTickCount: 0,
+        };
+      } else {
+        // 价格 tick 开始新K线
+        current = {
+          openTime:   bucket,
+          closeTime:  bucket + intervalMs,
+          open:       tick.price,
+          high:       tick.price,
+          low:        tick.price,
+          close:      tick.price,
+          volume:     0,          // volume 只来自链上交易
+          buyVolume:  0,
+          sellVolume: 0,
+          tickCount:  1,
+          priceTickCount: 1,
+        };
+      }
+    } else {
+      // 同一根 K 线内追加
+      if (isChainTick) {
+        // 链上 tick：只更新 volume
+        current.volume     += (tick.solAmount || 0);
+        current.buyVolume  += tick.isBuy  ? (tick.solAmount || 0) : 0;
+        current.sellVolume += !tick.isBuy ? (tick.solAmount || 0) : 0;
+        current.tickCount++;
+      } else {
+        // 价格 tick：更新 OHLC
+        if (current.open === null) {
+          // 这根K线之前只有链上 tick，现在才拿到价格
+          current.open  = tick.price;
+          current.high  = tick.price;
+          current.low   = tick.price;
+          current.close = tick.price;
+        } else {
+          if (tick.price > current.high) current.high = tick.price;
+          if (tick.price < current.low)  current.low  = tick.price;
+          current.close = tick.price;
+        }
+        current.tickCount++;
+        current.priceTickCount++;
+      }
+    }
+  }
+
+  if (!current) return { closed: candles, current: null };
+
+  const now = Date.now();
+  if (now >= current.closeTime) {
+    candles.push(current);
+    return { closed: candles, current: null };
+  }
+
+  return { closed: candles, current };
+}
+
+/**
+ * 过滤K线用于 RSI/EMA 计算：只保留有真实价格数据的K线
+ * 量能统计由 calcVolumeInfo() 单独从原始 rawCandles 里取，两者完全分离
+ */
+function filterValidCandles(candles) {
+  return candles.filter(c => c.open !== null && c.close !== null);
+}
+
+/**
+ * 从原始K线（含无价格的量能K线）计算量能信息
+ * 不依赖 filterValidCandles，直接扫描所有K线的 buyVolume/sellVolume
+ * @param {Array} rawCandles - buildCandles 返回的未过滤K线
+ * @param {number} windowBars - 统计窗口（根数）
+ * @param {number} klineSec - K线宽度（秒）
+ */
+function calcVolumeInfo(rawCandles, windowBars, klineSec) {
+  // ★ 先过滤出实时K线（非历史）
+  const liveCandles = rawCandles.filter(c => !c.fromHistory);
+
+  if (liveCandles.length === 0) {
+    return { currentVol: 0, buyVol: 0, sellVol: 0, buyRatio: 0, windowSec: 0, stale: false };
+  }
+
+  // ★ FIX: 标准窗口至少取 windowBars 根，但也保证至少 1 根（当前未收盘K线）
+  //   累加窗口内所有K线的 buyVolume/sellVolume（不是只看一根）
+  const stdLookback = Math.max(1, Math.min(liveCandles.length, windowBars));
+  let wc = liveCandles.slice(-stdLookback);
+
+  let winBuy = 0, winSell = 0;
+  for (const c of wc) {
+    winBuy  += (c.buyVolume  || 0);
+    winSell += (c.sellVolume || 0);
+  }
+
+  let stale = false;
+  // ★ FIX: 若标准窗口内无数据，往前最多找12根，累加最近一段有量能的K线之和
+  //   （而不是只取单一一根，避免"0.1/0.0"这种失真）
+  if (winBuy + winSell === 0 && liveCandles.length > stdLookback) {
+    const extLookback = Math.min(liveCandles.length, Math.max(12, stdLookback * 2));
+    const extCandles = liveCandles.slice(-extLookback);
+    // 从最新往回找到连续有量能的段：一旦发现第一根有量能的K线，就收集它及之后所有K线的量能
+    let firstNonZeroIdx = -1;
+    for (let i = extCandles.length - 1; i >= 0; i--) {
+      const c = extCandles[i];
+      if ((c.buyVolume || 0) + (c.sellVolume || 0) > 0) {
+        firstNonZeroIdx = i;
+        break;
+      }
+    }
+    if (firstNonZeroIdx >= 0) {
+      wc = extCandles.slice(firstNonZeroIdx);
+      winBuy = 0; winSell = 0;
+      for (const c of wc) {
+        winBuy  += (c.buyVolume  || 0);
+        winSell += (c.sellVolume || 0);
+      }
+      stale = true; // 标记为回溯数据，非当前窗口
+    }
+  }
+
+  const winTotal = winBuy + winSell;
+  const currentVol = wc.length > 0 ? (wc[wc.length - 1].volume || 0) : 0;
+
+  return {
+    currentVol,
+    buyVol:   winBuy,
+    sellVol:  winSell,
+    buyRatio: winTotal > 0 ? winBuy / winTotal : 0,
+    windowSec: wc.length * klineSec,
+    stale,
+  };
+}
+
+module.exports = {
+  evaluateSignal,
+  buildCandles,
+  filterValidCandles,
+  calcVolumeInfo,
+  calcRSIWithState,
+  stepRSI,
+  checkBuyVolume,
+  checkVolumeDecay,
+  checkStopLoss,
+  CONFIG: {
+    RSI_PERIOD, RSI_BUY, RSI_SELL, RSI_PANIC,
+    VOL_ENABLED, VOL_BUY_MULT, VOL_SELL_MULT, VOL_MIN_TOTAL, VOL_WINDOW_SEC,
+    VOL_EXIT_CONSECUTIVE, VOL_EXIT_RATIO, VOL_EXIT_LOOKBACK,
+    SKIP_FIRST_CANDLES,
+    TAKE_PROFIT_PCT, STOP_LOSS_PCT, KLINE_SEC,
+    TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATE, TRAILING_STOP_PCT,
+    EMA_PERIOD,
+  },
+};
