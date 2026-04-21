@@ -266,7 +266,10 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
 
   const MIN_CANDLES = RSI_PERIOD + 2;
   if (!closedCandles || closedCandles.length < MIN_CANDLES) {
-    return { rsi: NaN, prevRsi: NaN, signal: null, reason: 'warming_up', volume: volumeInfo };
+    // ★ V5-4: 附上当前根数,方便排查"长期 warming_up"的情况
+    const curLen = closedCandles ? closedCandles.length : 0;
+    return { rsi: NaN, prevRsi: NaN, signal: null,
+             reason: `warming_up(${curLen}/${MIN_CANDLES})`, volume: volumeInfo };
   }
 
   if (closedCandles.length < SKIP_FIRST_CANDLES) {
