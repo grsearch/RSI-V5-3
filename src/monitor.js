@@ -112,6 +112,7 @@ class TokenMonitor extends EventEmitter {
     this._stopLossLocks = new Set();
     this._slPollTimer = null;  // 独立止损轮询
     this._persistTimer = null; // ★ V5: 定时持久化
+    this._histRefreshTimer = null; // ★ V5-4 FIX#3: 历史K线定时刷新
   }
 
   start() {
@@ -146,6 +147,55 @@ class TokenMonitor extends EventEmitter {
     this._startOverviewPatrol();
     logger.info('[Monitor]   FDV退出<$%d  LP退出<$%d  最大监控=%d  巡检=%ds',
       FDV_EXIT, LP_EXIT, MAX_TOKENS, OVERVIEW_PATROL_SEC);
+
+    // ★ V5-4 FIX#3: 历史K线定期刷新(与 ticks 裁剪窗口 2 小时对齐)
+    //   原来 historicalCandles 只在启动 + addToken 时拉,长期监控的币(>2小时)就出现:
+    //     - ticks 裁剪窗口 = 2h → liveClosed 最多 24 根
+    //     - historicalCandles 覆盖"启动时 -12.5h ~ 启动时" → 随时间推移与实时出现大断层
+    //     - 断层处被 sanity check 判定为跳跃 → 历史K线被禁用 → closedCount = 24
+    //   解决:每 HIST_REFRESH_SEC 秒重新拉所有监控币的历史K线,并重置 _historicalCandlesDisabled
+    const HIST_REFRESH_SEC = parseInt(process.env.HIST_REFRESH_SEC || '7200', 10); // 默认 2h
+    if (HIST_REFRESH_SEC > 0) {
+      this._histRefreshTimer = setInterval(() => this._refreshAllHistory(), HIST_REFRESH_SEC * 1000);
+      logger.info('[Monitor]   历史K线刷新=%ds', HIST_REFRESH_SEC);
+    }
+  }
+
+  /** ★ V5-4 FIX#3: 批量刷新所有监控币的历史K线(分散请求避免突发) */
+  async _refreshAllHistory() {
+    const tokens = Array.from(this._tokens.values());
+    if (tokens.length === 0) return;
+    logger.info('[Monitor] 🔄 开始刷新 %d 个监控币的历史K线', tokens.length);
+    // 分散请求:每个币间隔 (HIST_REFRESH_SEC × 0.5 / tokens.length) 秒
+    const intervalMs = Math.max(200, (7200 * 500) / tokens.length); // 至少 200ms 间隔
+    let refreshed = 0, failed = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      const state = tokens[i];
+      // 检查 token 还在监控
+      if (!this._tokens.has(state.address)) continue;
+      try {
+        const histCandles = await birdeye.getOHLCV(state.address, KLINE_SEC, HIST_BARS);
+        if (!histCandles || histCandles.length === 0) {
+          failed++;
+          continue;
+        }
+        const clean = _sanitizeHistoricalCandles(histCandles, state.symbol);
+        if (clean.length > 0) {
+          state.historicalCandles = clean;
+          // ★ 重置禁用标记 —— 新数据重新验证
+          state._historicalCandlesDisabled = false;
+          refreshed++;
+        } else {
+          failed++;
+        }
+      } catch (err) {
+        failed++;
+        logger.warn('[Monitor] 刷新历史K线失败 %s: %s', state.symbol, err.message);
+      }
+      // 间隔
+      if (i < tokens.length - 1) await new Promise(r => setTimeout(r, intervalMs));
+    }
+    logger.info('[Monitor] ✅ 历史K线刷新完成: 成功=%d 失败=%d', refreshed, failed);
   }
 
   _loadPersistedTokens() {
@@ -246,6 +296,7 @@ class TokenMonitor extends EventEmitter {
     if (this._slPollTimer) { clearInterval(this._slPollTimer); this._slPollTimer = null; }
     if (this._persistTimer) { clearInterval(this._persistTimer); this._persistTimer = null; }
     if (this._patrolTimer) { clearTimeout(this._patrolTimer); this._patrolTimer = null; }
+    if (this._histRefreshTimer) { clearInterval(this._histRefreshTimer); this._histRefreshTimer = null; }
     this._persistTokens();  // ★ V5: 关闭前最后保存一次
     birdeye.priceStream.stop();
     heliusWs.stop();
@@ -624,24 +675,27 @@ class TokenMonitor extends EventEmitter {
         if (state.ticks.length > 0) {
           const { closed: rawCandles } = buildCandles(state.ticks, KLINE_SEC);
           const liveCandles = filterValidCandles(rawCandles); // RSI用
-          // ★ 合并历史K线（RSI用）—— 应用同样的价格连续性检查
+          // ★ 合并历史K线（RSI用）—— V5-4 FIX#3: Map 合并去重,而非 filter
           let closedCandles = liveCandles;
           if (!state._historicalCandlesDisabled && state.historicalCandles && state.historicalCandles.length > 0) {
-            const liveStart2 = liveCandles.length > 0 ? liveCandles[0].openTime : Infinity;
-            const histFiltered2 = state.historicalCandles.filter(c => c.openTime < liveStart2);
-            if (histFiltered2.length > 0 && liveCandles.length > 0) {
-              const histLastClose = histFiltered2[histFiltered2.length - 1].close;
-              const liveFirstOpen = liveCandles[0].open;
+            const merged = new Map();
+            for (const c of state.historicalCandles) merged.set(c.openTime, c);
+            for (const c of liveCandles) merged.set(c.openTime, c);
+            const mergedArr = [...merged.values()].sort((a, b) => a.openTime - b.openTime);
+            const histPart = mergedArr.filter(c => c.fromHistory);
+            const livePart = mergedArr.filter(c => !c.fromHistory);
+            if (histPart.length > 0 && livePart.length > 0) {
+              const histLastClose = histPart[histPart.length - 1].close;
+              const liveFirstOpen = livePart[0].open;
               if (histLastClose > 0 && liveFirstOpen > 0) {
                 const jumpPct = Math.abs(liveFirstOpen - histLastClose) / histLastClose;
-                // ★ V5-4: 与主路径保持一致,使用 HIST_JUMP_MAX（默认 30%）
                 if (jumpPct > HIST_JUMP_MAX) {
                   state._historicalCandlesDisabled = true;
                 }
               }
             }
             if (!state._historicalCandlesDisabled) {
-              closedCandles = [...histFiltered2, ...liveCandles];
+              closedCandles = mergedArr;
             }
           }
           if (closedCandles.length >= RSI_CONFIG.RSI_PERIOD + 2) {
@@ -903,29 +957,63 @@ class TokenMonitor extends EventEmitter {
     }
 
     // ★ 合并历史K线（RSI/EMA用）：历史candles在前，实时candles在后
+    //   ★ V5-4 FIX#3: 原逻辑 `filter(c => c.openTime < liveStart)` 会把**所有晚于**
+    //     liveStart 的历史 K 线扔掉。场景:币被监控 2 小时,Birdeye 拉了 154 根历史(覆盖
+    //     最近 24 小时),`liveStart` = 2 小时前 → 历史 K 线中最近 2 小时的部分(约 24 根)
+    //     被错误丢弃,结果 `closedCandles = liveClosed` ≈ 24 根(只剩监控期间累积的)。
+    //     正确做法:保留历史 K 线中早于 liveStart 的部分,拼上实时 K 线 —— 实时覆盖重叠区
+    //     (实时数据比历史更准、含真实买卖方向)。这里逻辑不变,但要确保 `liveStart` 的
+    //     取值是"第一根实时 K 线的 openTime",代码里已是如此,bug 在于理解:历史 K 线里
+    //     晚于 liveStart 的部分其实**已经被实时 K 线覆盖了**(openTime 一致),所以过滤是
+    //     正确的 —— 除非 Birdeye 历史比实时数据更新(几乎不可能,除非实时 ticks 没积累够)
+    //
+    //   真正的 bug 在于:当 `state.ticks` 的时间覆盖 > 监控时长(因为 dataStore 从磁盘
+    //   恢复了 2 小时内的历史 tick)时,`liveClosed` 可能有 24 根但 `liveStart` 却是 2
+    //   小时前。而 Birdeye 历史 K 线覆盖 24 小时,前 22 小时该保留的都被保留了 → 合计应
+    //   有 24(实时) + N(历史 22 小时前部分) = 正常值。
+    //
+    //   **真凶**:实际上 Birdeye 历史 K 线的最后一根 openTime 是 **现在时刻附近**(拉数据
+    //   时刻),不是 2 小时前。如果历史 K 线 timestamps 末尾延伸到现在,而 `liveStart` 是
+    //   2 小时前,那 filter 丢弃的是**最近 2 小时的历史 K 线 = 24 根**,保留的是更早的 130
+    //   根 — 这样 closedCandles 应该有 130+24=154 根,不是 24。
+    //
+    //   所以图上 24 根说明 `state.historicalCandles` 要么空,要么被 _historicalCandlesDisabled
+    //   禁用(而图1/2/3 日志显示没被禁用)。第三种可能:`historicalCandles.filter(...).length === 0`
+    //   发生在历史 K 线**全部**晚于 liveStart 的情况 —— 即 Birdeye 只返回了**近 2 小时内**的数据
+    //   (比如一个 B 级 API key 的历史数据上限),然后被 filter 全丢,结果 `histFiltered = []`,
+    //   closedCandles = liveClosed = 24 根。
+    //
+    //   修复:改用"合并去重"逻辑,以 openTime 为键,实时覆盖历史(重叠部分以实时为准),
+    //   避免 filter 把需要的历史数据丢掉。
     let closedCandles = liveClosed;
-    if (state.historicalCandles && state.historicalCandles.length > 0) {
-      const liveStart = liveClosed.length > 0 ? liveClosed[0].openTime : Infinity;
-      const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
-      // ★ FIX: 历史K线和实时K线的拼接处如果价格跳跃过大,会导致RSI算出虚假高值(>90)
-      //   这种情况丢弃历史K线,只用实时数据(等K线自然累积)
-      if (histFiltered.length > 0 && liveClosed.length > 0 && !state._historicalCandlesDisabled) {
-        const histLastClose = histFiltered[histFiltered.length - 1].close;
-        const liveFirstOpen = liveClosed[0].open;
+    if (state.historicalCandles && state.historicalCandles.length > 0
+        && !state._historicalCandlesDisabled) {
+      // 用 Map 按 openTime 合并:历史先进,实时覆盖(重叠 openTime 以实时为准)
+      const merged = new Map();
+      for (const c of state.historicalCandles) merged.set(c.openTime, c);
+      for (const c of liveClosed) merged.set(c.openTime, c);
+      const mergedArr = [...merged.values()].sort((a, b) => a.openTime - b.openTime);
+
+      // 仍然做拼接处/内部跳跃检查,但针对 mergedArr(而不是 filter 后的子集)
+      // 检查历史段(merged 里 fromHistory 的那些)内部是否有跳跃,以及历史最后一根和实时第一根是否跳
+      const histPart = mergedArr.filter(c => c.fromHistory);
+      const livePart = mergedArr.filter(c => !c.fromHistory);
+
+      if (histPart.length > 0 && livePart.length > 0) {
+        const histLastClose = histPart[histPart.length - 1].close;
+        const liveFirstOpen = livePart[0].open;
         if (histLastClose > 0 && liveFirstOpen > 0) {
           const jumpPct = Math.abs(liveFirstOpen - histLastClose) / histLastClose;
-          // ★ V5-4: 阈值从 10% 放宽到 HIST_JUMP_MAX（默认 30%），避免 Pump.fun 新币误伤
           if (jumpPct > HIST_JUMP_MAX) {
             logger.warn('[Monitor] %s 历史K线和实时K线拼接处价格跳跃过大(%.1f%%,阈值%.0f%%),仅使用实时K线',
               state.symbol, jumpPct * 100, HIST_JUMP_MAX * 100);
             state._historicalCandlesDisabled = true;
           }
         }
-        // ★ V5-4: 再加一层 —— 直接检查历史K线内部有没有相邻大跳(> HIST_JUMP_MAX),有就禁用
         if (!state._historicalCandlesDisabled) {
-          for (let i = 1; i < histFiltered.length; i++) {
-            const prev = histFiltered[i - 1];
-            const cur = histFiltered[i];
+          for (let i = 1; i < histPart.length; i++) {
+            const prev = histPart[i - 1];
+            const cur = histPart[i];
             if (prev.close > 0 && cur.open > 0) {
               const gap = Math.abs(cur.open - prev.close) / prev.close;
               if (gap > HIST_JUMP_MAX) {
@@ -939,7 +1027,7 @@ class TokenMonitor extends EventEmitter {
         }
       }
       if (!state._historicalCandlesDisabled) {
-        closedCandles = [...histFiltered, ...liveClosed];
+        closedCandles = mergedArr;
       }
     }
     // ★ 量能用：原始K线（含无价格的链上K线）+ 当前未收盘K线，历史K线在前
@@ -989,6 +1077,21 @@ class TokenMonitor extends EventEmitter {
     state._lastSignal      = signal || null;
     state._lastReason      = reason || '';
     state._lastClosedCount = closedCandles.length;
+
+    // ★ V5-4 FIX#3: 每 60 秒打一次 closedCount 分解诊断日志(每个币)
+    //   用于排查"为什么前端只显示 24 根"这类问题 —— 能立即看到历史/实时的合并情况
+    {
+      const lastDiagTs = state._lastCountDiagTs ?? 0;
+      if (now - lastDiagTs > 60000) {
+        state._lastCountDiagTs = now;
+        const histInClosed = closedCandles.filter(c => c.fromHistory).length;
+        const liveInClosed = closedCandles.length - histInClosed;
+        const histTotal = state.historicalCandles ? state.historicalCandles.length : 0;
+        const disabled = state._historicalCandlesDisabled ? 'DISABLED' : 'ok';
+        logger.info('[Monitor] 📊 %s 诊断: closedCount=%d (历史%d+实时%d) | 原始历史%d根 | hist状态=%s',
+          state.symbol, closedCandles.length, histInClosed, liveInClosed, histTotal, disabled);
+      }
+    }
 
     // ★ FIX: 显示层统一用 _refreshLiveVolume —— 严格 VOL_WINDOW_SEC 秒的滑动窗口
     //   不再和 evaluateSignal 返回的 K 线量能做 Math.max 合并，避免：

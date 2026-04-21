@@ -496,9 +496,15 @@ async function getOHLCV(address, intervalSec, bars = 150) {
     }
 
     // 转换为系统 candle 格式
+    //   ★ V5-4 FIX#3: 强制对齐到 intervalSec 整数边界,确保与 buildCandles 计算的
+    //     bucket(Math.floor(ts/intervalMs)*intervalMs) 一致。若不对齐,Map 合并时
+    //     历史和实时 K 线因 openTime 有毫秒级差异会被视作两根不同 K 线,导致数组膨胀
+    //     或错位。
+    const intervalMs = intervalSec * 1000;
     const candles = items.map(item => {
-      const openTime  = item.unixTime * 1000;          // 秒 → 毫秒
-      const closeTime = openTime + intervalSec * 1000;
+      const rawOpenTime = item.unixTime * 1000;            // 秒 → 毫秒
+      const openTime    = Math.floor(rawOpenTime / intervalMs) * intervalMs;
+      const closeTime   = openTime + intervalMs;
       return {
         openTime,
         closeTime,
