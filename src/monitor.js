@@ -61,30 +61,35 @@ function _loadPersistedTrades() {
 //     只有 >30% 的相邻跳跃才认为是数据拼接错误/闪崩/价格源异常。
 //     高低差阈值 hi-lo 由 50% 放宽到 80%（单根 K 线内部极大波动才算异常）。
 //   阈值可通过环境变量覆盖：HIST_JUMP_MAX（默认 0.30）、HIST_HILOW_MAX（默认 0.80）。
+//
+//   ★ V5-4 FIX#2: slice 起点从 i 改为 i+1
+//     原逻辑保留了异常K线 cur 本身,后续 _poll 二次 check 又会在 cur vs cur-1 处检测到
+//     巨大跳跃,再次将整段历史K线禁用,结果 EMA99_WARMING_UP。正确做法是丢弃包含
+//     异常K线本身,从它之后的第一根开始保留。
 const HIST_JUMP_MAX  = parseFloat(process.env.HIST_JUMP_MAX  || '0.30');
 const HIST_HILOW_MAX = parseFloat(process.env.HIST_HILOW_MAX || '0.80');
 function _sanitizeHistoricalCandles(candles, symbol) {
   if (!candles || candles.length < 2) return candles || [];
-  // 从新到旧扫描(最近的在数组末尾),找到最近的"大跳"位置,丢弃跳前的所有K线
+  // 从新到旧扫描(最近的在数组末尾),找到最近的"大跳"位置,丢弃跳前所有K线(含跳K线本身)
   let keepFromIdx = 0;
   for (let i = candles.length - 1; i >= 1; i--) {
     const prev = candles[i - 1];
     const cur = candles[i];
     if (!prev.close || !cur.open) continue;
     const gap = Math.abs(cur.open - prev.close) / prev.close;
-    // 相邻K线价格跳跃 > HIST_JUMP_MAX → 这是个异常点,只保留 i 之后的K线(包括 cur)
+    // 相邻K线价格跳跃 > HIST_JUMP_MAX → 异常点,丢弃 cur 本身及之前所有
     if (gap > HIST_JUMP_MAX) {
-      keepFromIdx = i;
-      logger.warn('[Monitor] %s 历史K线内部价格跳跃(%.1f%% at idx=%d,阈值%.0f%%),丢弃前 %d 根,保留后 %d 根',
-        symbol, gap * 100, i, HIST_JUMP_MAX * 100, i, candles.length - i);
+      keepFromIdx = i + 1; // ★ V5-4 FIX#2: 从 i+1 开始保留,丢弃 cur 本身
+      logger.warn('[Monitor] %s 历史K线内部价格跳跃(%.1f%% at idx=%d,阈值%.0f%%),丢弃前 %d 根(含该根),保留后 %d 根',
+        symbol, gap * 100, i, HIST_JUMP_MAX * 100, keepFromIdx, candles.length - keepFromIdx);
       break;
     }
     // K线内部价格极端波动也视为异常(high/low 差 > HIST_HILOW_MAX)
     const hilow = cur.high && cur.low ? (cur.high - cur.low) / cur.low : 0;
     if (hilow > HIST_HILOW_MAX) {
-      keepFromIdx = i;
-      logger.warn('[Monitor] %s 历史K线内部波动极大(hi-lo %.1f%% at idx=%d,阈值%.0f%%),丢弃前 %d 根',
-        symbol, hilow * 100, i, HIST_HILOW_MAX * 100, i);
+      keepFromIdx = i + 1; // ★ V5-4 FIX#2: 从 i+1 开始保留,丢弃 cur 本身
+      logger.warn('[Monitor] %s 历史K线内部波动极大(hi-lo %.1f%% at idx=%d,阈值%.0f%%),丢弃前 %d 根(含该根),保留后 %d 根',
+        symbol, hilow * 100, i, HIST_HILOW_MAX * 100, keepFromIdx, candles.length - keepFromIdx);
       break;
     }
   }
