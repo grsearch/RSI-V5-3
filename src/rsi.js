@@ -43,11 +43,30 @@ const TRAILING_STOP_PCT      = parseFloat(process.env.TRAILING_STOP_PCT      || 
 // EMA99 买入过滤：价格必须在 EMA99 下方才允许买入
 const EMA_PERIOD = parseInt(process.env.EMA_PERIOD || '99', 10);
 
+// ★ V6: 支持 K 线不足时返回近似 EMA(用全部可用数据的 EMA),避免 EMA99 过滤失效
+//   当 closes.length < period 时:
+//     - 至少需要 min(period, MIN_BARS_FOR_APPROX) 根才计算近似 EMA
+//     - 少于 MIN_BARS_FOR_APPROX 才返回 NaN(过滤真正禁用)
 function calcEMA(closes, period) {
-  if (closes.length < period) return NaN;
-  const k = 2 / (period + 1);
-  let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
-  for (let i = period; i < closes.length; i++) {
+  const MIN_BARS_FOR_APPROX = 20; // 至少 20 根才有意义
+  if (!closes || closes.length < MIN_BARS_FOR_APPROX) return NaN;
+
+  if (closes.length >= period) {
+    // 标准 EMA 计算
+    const k = 2 / (period + 1);
+    let ema = closes.slice(0, period).reduce((s, v) => s + v, 0) / period;
+    for (let i = period; i < closes.length; i++) {
+      ema = closes[i] * k + ema * (1 - k);
+    }
+    return ema;
+  }
+
+  // ★ K线不足 period 根,用可用数据计算"短期EMA",作为近似
+  //   周期自适应 = 实际可用根数,避免过度偏向早期(这是简化 SMA→EMA 过渡)
+  const effectivePeriod = closes.length;
+  const k = 2 / (effectivePeriod + 1);
+  let ema = closes[0];
+  for (let i = 1; i < closes.length; i++) {
     ema = closes[i] * k + ema * (1 - k);
   }
   return ema;
@@ -355,11 +374,28 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
   if (!tokenState.inPosition) {
     if (rsiRealtime < RSI_BUY && lastCandleTs !== lastBuyCandle) {
       // ★ EMA99 过滤：价格必须在 EMA99 下方才允许买入
+      //   ★ V6: 修复 EMA99 过滤失效 bug
+      //     - 以前: calcEMA 在 closes.length < 99 时返回 NaN,过滤直接被跳过,任何价位都能买
+      //     - 现在: K线不足时 calcEMA 返回近似 EMA(基于可用K线),仍可过滤
+      //     - EMA_STRICT_MIN_BARS 环境变量控制严格模式:K线少于此值拒绝买入(保守默认)
+      const EMA_STRICT_MIN_BARS = parseInt(process.env.EMA_STRICT_MIN_BARS || '30', 10);
       const ema99 = calcEMA(closes, EMA_PERIOD);
-      if (Number.isFinite(ema99) && realtimePrice >= ema99) {
+      if (closes.length < EMA_STRICT_MIN_BARS) {
+        // K线太少,EMA99 完全不可信,保守拒买
         updateState();
         return { rsi: rsiRealtime, prevRsi, signal: null,
-                 reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)})`, volume: volumeInfo };
+                 reason: `EMA99_WARMING_UP(candles=${closes.length}<${EMA_STRICT_MIN_BARS})`, volume: volumeInfo };
+      }
+      if (!Number.isFinite(ema99)) {
+        // 异常情况(理论上 closes.length >= 20 时 calcEMA 不应返回 NaN)
+        updateState();
+        return { rsi: rsiRealtime, prevRsi, signal: null,
+                 reason: `EMA99_NAN`, volume: volumeInfo };
+      }
+      if (realtimePrice >= ema99) {
+        updateState();
+        return { rsi: rsiRealtime, prevRsi, signal: null,
+                 reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)},candles=${closes.length})`, volume: volumeInfo };
       }
 
       const volCheck = checkBuyVolume(_rawForVol, null); // 用原始K线（含量能）做量能判断
@@ -372,7 +408,7 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
         // 这样冷却期内不会白白消耗K线槽位，冷却结束后第一根满足条件的K线即可买入
         updateState();
         return { rsi: rsiRealtime, prevRsi, signal: 'BUY',
-                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+EMA99OK+${volCheck.reason}`,
+                 reason: `RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})+EMA99OK(${realtimePrice.toFixed(6)}<${ema99.toFixed(6)})+${volCheck.reason}`,
                  volume: volumeInfo, candleTs: lastCandleTs };
       }
       // 量能不达标，不标记 lastBuyCandle，下根K线继续检查
