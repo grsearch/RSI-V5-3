@@ -314,11 +314,20 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState, rawCandles) {
     }
 
     // 2. RSI 下穿 70
+    //    ★ V6: 加 RSI 跳跃保护,防止历史/实时K线拼接处脏数据导致的假下穿
     if (prevRsi >= RSI_SELL && rsiRealtime < RSI_SELL && lastCandleTs !== lastSellCandle) {
-      tokenState._lastSellCandle = lastCandleTs;
-      updateState();
-      return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
-               reason: `RSI_CROSS_DOWN_70(${prevRsi.toFixed(1)}→${rsiRealtime.toFixed(1)})`, volume: volumeInfo };
+      const rsiJump = Math.abs(prevRsi - rsiRealtime);
+      if (rsiJump > 30) {
+        // RSI 单次变化 >30 点不合理(RSI(7) 正常单K线变化应 <15 点)
+        //   标记历史K线污染,让 monitor 在下次 _poll 时禁用历史K线并重算
+        tokenState._rsiDataTainted = true;
+        // 不触发卖出,跳过
+      } else {
+        tokenState._lastSellCandle = lastCandleTs;
+        updateState();
+        return { rsi: rsiRealtime, prevRsi, signal: 'SELL',
+                 reason: `RSI_CROSS_DOWN_70(${prevRsi.toFixed(1)}→${rsiRealtime.toFixed(1)})`, volume: volumeInfo };
+      }
     }
 
     // 3. 止盈 / 止损（也在 evaluateSignal 中保留，双重保险）

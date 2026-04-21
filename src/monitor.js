@@ -52,6 +52,43 @@ function _loadPersistedTrades() {
   } catch (_) {}
 }
 
+// ★ V6: 历史K线 sanity check —— 过滤内部有异常跳跃的K线序列
+//   返回过滤后的数组(截取到第一个异常点之后的部分,保留更近的可靠数据)
+//   如果整体都异常,返回空数组
+function _sanitizeHistoricalCandles(candles, symbol) {
+  if (!candles || candles.length < 2) return candles || [];
+  // 从新到旧扫描(最近的在数组末尾),找到最近的"大跳"位置,丢弃跳前的所有K线
+  let keepFromIdx = 0;
+  for (let i = candles.length - 1; i >= 1; i--) {
+    const prev = candles[i - 1];
+    const cur = candles[i];
+    if (!prev.close || !cur.open) continue;
+    const gap = Math.abs(cur.open - prev.close) / prev.close;
+    // 相邻K线价格跳跃 > 10% → 这是个异常点,只保留 i 之后的K线(包括 cur)
+    if (gap > 0.10) {
+      keepFromIdx = i;
+      logger.warn('[Monitor] %s 历史K线内部价格跳跃(%.1f%% at idx=%d),丢弃前 %d 根,保留后 %d 根',
+        symbol, gap * 100, i, i, candles.length - i);
+      break;
+    }
+    // K线内部价格极端波动也视为异常(high/low 差 >50%)
+    const hilow = cur.high && cur.low ? (cur.high - cur.low) / cur.low : 0;
+    if (hilow > 0.50) {
+      keepFromIdx = i;
+      logger.warn('[Monitor] %s 历史K线内部波动极大(hi-lo %.1f%% at idx=%d),丢弃前 %d 根',
+        symbol, hilow * 100, i, i);
+      break;
+    }
+  }
+  // 如果保留下来的太少(<K线20根),不如全部丢弃,等实时K线累积
+  if (keepFromIdx > 0 && (candles.length - keepFromIdx) < 20) {
+    logger.warn('[Monitor] %s 历史K线清洗后仅余 %d 根(不足20根),全部丢弃,等实时K线累积',
+      symbol, candles.length - keepFromIdx);
+    return [];
+  }
+  return candles.slice(keepFromIdx);
+}
+
 class TokenMonitor extends EventEmitter {
   constructor() {
     super();
@@ -155,8 +192,12 @@ class TokenMonitor extends EventEmitter {
           birdeye.getOHLCV(t.address, KLINE_SEC, HIST_BARS).then(histCandles => {
             const s = this._tokens.get(t.address);
             if (!s || !histCandles || histCandles.length === 0) return;
-            s.historicalCandles = histCandles;
-            logger.info('[Monitor] ♻️ %s 历史K线重载: %d 根', t.symbol, histCandles.length);
+            // ★ V6: sanity check
+            const clean = _sanitizeHistoricalCandles(histCandles, t.symbol);
+            if (clean.length > 0) {
+              s.historicalCandles = clean;
+              logger.info('[Monitor] ♻️ %s 历史K线重载: %d/%d 根', t.symbol, clean.length, histCandles.length);
+            }
           }).catch(() => {});
         }
       }
@@ -283,9 +324,15 @@ class TokenMonitor extends EventEmitter {
       try {
         const histCandles = await birdeye.getOHLCV(address, KLINE_SEC, HIST_BARS);
         if (histCandles && histCandles.length > 0) {
-          s.historicalCandles = histCandles;
-          logger.info('[Monitor] %s 历史K线预热: %d 根 (EMA99/RSI立即可用)',
-            symbol, histCandles.length);
+          // ★ V6: sanity check —— 过滤掉有异常跳跃的历史K线,避免污染RSI
+          const clean = _sanitizeHistoricalCandles(histCandles, symbol);
+          if (clean.length > 0) {
+            s.historicalCandles = clean;
+            logger.info('[Monitor] %s 历史K线预热: %d/%d 根 (EMA99/RSI立即可用)',
+              symbol, clean.length, histCandles.length);
+          } else {
+            logger.warn('[Monitor] %s 历史K线全部不可信,不加载历史,等实时K线累积', symbol);
+          }
         }
       } catch (_) {}
     })();
@@ -396,15 +443,22 @@ class TokenMonitor extends EventEmitter {
 
     // ── RSI 下穿 70（实时：prevRsi >= 70 且 rsiNow < 70）──
     //    下穿检测只看方向变化，对绝对值精度要求低，stepRSI可信
+    //    ★ V6: 加 RSI 跳跃保护
     if (prevRsi >= _RSI_SELL && rsiNow < _RSI_SELL) {
-      const lastCrossTs = state._lastRsiCrossSellTs ?? 0;
-      if (now - lastCrossTs >= 2000) {
-        state._lastRsiCrossSellTs = now;
-        logger.info('[Monitor] ⚡ WS实时RSI下穿卖出 %s @ %.8f | RSI %.1f→%.1f',
-          state.symbol, price, prevRsi, rsiNow);
-        this._doSell(state, `RSI_CROSS_DOWN_70_RT(${prevRsi.toFixed(1)}→${rsiNow.toFixed(1)})`).catch(err => {
-          logger.error('[Monitor] WS RSI下穿卖出失败 %s: %s', state.symbol, err.message);
-        });
+      const rsiJump = Math.abs(prevRsi - rsiNow);
+      if (rsiJump > 30) {
+        // 两次WS tick之间RSI变化>30 → 脏数据,不触发并标记清缓存
+        state._rsiDataTainted = true;
+      } else {
+        const lastCrossTs = state._lastRsiCrossSellTs ?? 0;
+        if (now - lastCrossTs >= 2000) {
+          state._lastRsiCrossSellTs = now;
+          logger.info('[Monitor] ⚡ WS实时RSI下穿卖出 %s @ %.8f | RSI %.1f→%.1f',
+            state.symbol, price, prevRsi, rsiNow);
+          this._doSell(state, `RSI_CROSS_DOWN_70_RT(${prevRsi.toFixed(1)}→${rsiNow.toFixed(1)})`).catch(err => {
+            logger.error('[Monitor] WS RSI下穿卖出失败 %s: %s', state.symbol, err.message);
+          });
+        }
       }
     }
   }
@@ -606,29 +660,54 @@ class TokenMonitor extends EventEmitter {
               // RSI 下穿70：支持两种 prev 来源
               //   a) 上次轮询的实时 RSI (prevRsiPoll) — 500ms 间隔的 tick-to-tick 比较
               //   b) 最新已收盘K线 RSI (rsiClosedLast) — K线级别的下穿
+              //   ★ V6: 两条分支都加 RSI 跳跃保护(>30 视为脏数据)
               else if (Number.isFinite(prevRsiPoll) && prevRsiPoll >= _RSI_SELL && rsiRealtime < _RSI_SELL) {
-                const lastCrossTs = state._lastRsiCrossSellTs ?? 0;
-                if (Date.now() - lastCrossTs >= 2000) {
-                  state._lastRsiCrossSellTs = Date.now();
-                  logger.info('[Monitor] ⚡ RSI下穿卖出(轮询RT) %s @ %.8f | RSI %.1f→%.1f',
-                    state.symbol, price, prevRsiPoll, rsiRealtime);
-                  this._doSell(state, `RSI_CROSS_DOWN_70(RT:${prevRsiPoll.toFixed(1)}→${rsiRealtime.toFixed(1)})`).catch(err => {
-                    logger.error('[Monitor] RSI下穿卖出失败 %s: %s', state.symbol, err.message);
-                  });
+                const rsiJump = Math.abs(prevRsiPoll - rsiRealtime);
+                if (rsiJump > 30) {
+                  state._rsiDataTainted = true;
+                  logger.warn('[Monitor] %s 轮询RT RSI跳跃异常(%.1f→%.1f,差%.1f),跳过',
+                    state.symbol, prevRsiPoll, rsiRealtime, rsiJump);
+                } else {
+                  const lastCrossTs = state._lastRsiCrossSellTs ?? 0;
+                  if (Date.now() - lastCrossTs >= 2000) {
+                    state._lastRsiCrossSellTs = Date.now();
+                    logger.info('[Monitor] ⚡ RSI下穿卖出(轮询RT) %s @ %.8f | RSI %.1f→%.1f',
+                      state.symbol, price, prevRsiPoll, rsiRealtime);
+                    this._doSell(state, `RSI_CROSS_DOWN_70(RT:${prevRsiPoll.toFixed(1)}→${rsiRealtime.toFixed(1)})`).catch(err => {
+                      logger.error('[Monitor] RSI下穿卖出失败 %s: %s', state.symbol, err.message);
+                    });
+                  }
                 }
               }
               // 备用：已收盘K线级别下穿（保留原逻辑作为兜底）
               else if (Number.isFinite(rsiClosedLast)) {
                 const rsiPrevClosed = rsiArray[len - 2];
                 if (Number.isFinite(rsiPrevClosed) && rsiPrevClosed >= _RSI_SELL && rsiClosedLast < _RSI_SELL) {
-                  const candleTs = closedCandles[len - 1].openTime;
-                  if (candleTs !== state._lastSellCandle) {
-                    state._lastSellCandle = candleTs;
-                    logger.info('[Monitor] ⚡ RSI下穿卖出(K线) %s @ %.8f | RSI %.1f→%.1f',
-                      state.symbol, price, rsiPrevClosed, rsiClosedLast);
-                    this._doSell(state, `RSI_CROSS_DOWN_70(K:${rsiPrevClosed.toFixed(1)}→${rsiClosedLast.toFixed(1)})`).catch(err => {
-                      logger.error('[Monitor] RSI下穿卖出失败 %s: %s', state.symbol, err.message);
-                    });
+                  // ★ V6: RSI 两根相邻K线的变化应该 ≤ 30(RSI 真实波动不可能一根K线跳 47 点)
+                  //   超过 30 很可能是历史K线和实时K线拼接处的虚假数据,拒绝触发
+                  const rsiJump = Math.abs(rsiPrevClosed - rsiClosedLast);
+                  if (rsiJump > 30) {
+                    logger.warn('[Monitor] %s RSI相邻K线跳跃异常(%.1f→%.1f,差%.1f),跳过下穿70判定',
+                      state.symbol, rsiPrevClosed, rsiClosedLast, rsiJump);
+                    // 同时标记历史K线污染,下次 _poll 会禁用历史K线
+                    state._historicalCandlesDisabled = true;
+                    // 清空 RSI 缓存,强制下次用纯实时K线重算
+                    state._rsiAvgGain = NaN;
+                    state._rsiAvgLoss = NaN;
+                    state._rsiLastClose = NaN;
+                    state._rsiLastCandleTs = -1;
+                    state._slPollPrevRsi = NaN;
+                    state._wsTickPrevRsi = NaN;
+                  } else {
+                    const candleTs = closedCandles[len - 1].openTime;
+                    if (candleTs !== state._lastSellCandle) {
+                      state._lastSellCandle = candleTs;
+                      logger.info('[Monitor] ⚡ RSI下穿卖出(K线) %s @ %.8f | RSI %.1f→%.1f',
+                        state.symbol, price, rsiPrevClosed, rsiClosedLast);
+                      this._doSell(state, `RSI_CROSS_DOWN_70(K:${rsiPrevClosed.toFixed(1)}→${rsiClosedLast.toFixed(1)})`).catch(err => {
+                        logger.error('[Monitor] RSI下穿卖出失败 %s: %s', state.symbol, err.message);
+                      });
+                    }
                   }
                 }
               }
@@ -729,6 +808,23 @@ class TokenMonitor extends EventEmitter {
     // 6. 聚合 K 线（历史K线 + 实时ticks合并）
     const { closed: rawClosedCandles, current: currentCandle } = buildCandles(state.ticks, KLINE_SEC);
     const liveClosed = filterValidCandles(rawClosedCandles); // RSI用：只含真实价格K线
+
+    // ★ V6: RSI 污染标记传播 —— evaluateSignal 检测到 RSI 相邻值跳跃 >30 会设置此标记
+    //   收到标记后禁用历史K线并清空RSI缓存,让下次重算用纯实时K线
+    if (state._rsiDataTainted) {
+      state._historicalCandlesDisabled = true;
+      state._rsiAvgGain = NaN;
+      state._rsiAvgLoss = NaN;
+      state._rsiLastClose = NaN;
+      state._rsiLastCandleTs = -1;
+      state._slPollPrevRsi = NaN;
+      state._wsTickPrevRsi = NaN;
+      state._prevRsiRealtime = NaN;
+      state._rsiDataTainted = false;
+      logger.warn('[Monitor] %s RSI数据被标记污染,已禁用历史K线并清空RSI缓存',
+        state.symbol);
+    }
+
     // ★ 合并历史K线（RSI/EMA用）：历史candles在前，实时candles在后
     let closedCandles = liveClosed;
     if (state.historicalCandles && state.historicalCandles.length > 0) {
@@ -736,16 +832,32 @@ class TokenMonitor extends EventEmitter {
       const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
       // ★ FIX: 历史K线和实时K线的拼接处如果价格跳跃过大,会导致RSI算出虚假高值(>90)
       //   这种情况丢弃历史K线,只用实时数据(等K线自然累积)
-      if (histFiltered.length > 0 && liveClosed.length > 0) {
+      if (histFiltered.length > 0 && liveClosed.length > 0 && !state._historicalCandlesDisabled) {
         const histLastClose = histFiltered[histFiltered.length - 1].close;
         const liveFirstOpen = liveClosed[0].open;
         if (histLastClose > 0 && liveFirstOpen > 0) {
           const jumpPct = Math.abs(liveFirstOpen - histLastClose) / histLastClose;
-          // 价格跳跃 > 15% → 不拼接,只用实时K线
-          if (jumpPct > 0.15) {
+          // ★ V6: 阈值 15% → 10% (更严格)
+          if (jumpPct > 0.10) {
             logger.warn('[Monitor] %s 历史K线和实时K线拼接处价格跳跃过大(%.1f%%),仅使用实时K线',
               state.symbol, jumpPct * 100);
             state._historicalCandlesDisabled = true;
+          }
+        }
+        // ★ V6: 再加一层 —— 直接检查历史K线内部有没有相邻大跳(>10%),有就禁用
+        if (!state._historicalCandlesDisabled) {
+          for (let i = 1; i < histFiltered.length; i++) {
+            const prev = histFiltered[i - 1];
+            const cur = histFiltered[i];
+            if (prev.close > 0 && cur.open > 0) {
+              const gap = Math.abs(cur.open - prev.close) / prev.close;
+              if (gap > 0.10) {
+                logger.warn('[Monitor] %s 历史K线内部价格跳跃过大(%.1f%% at idx=%d),仅使用实时K线',
+                  state.symbol, gap * 100, i);
+                state._historicalCandlesDisabled = true;
+                break;
+              }
+            }
           }
         }
       }
