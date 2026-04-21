@@ -464,7 +464,15 @@ async function getOHLCV(address, intervalSec, bars = 150) {
   }
 
   const now       = Math.floor(Date.now() / 1000);
-  const time_from = now - intervalSec * (bars + 5); // 多拉5根，确保有足够数据
+  // ★ V5-4 FIX: 回溯时间窗口独立于 K 线根数
+  //   Birdeye 只返回"有交易的" K 线,对上线几天但进入僵尸期的低流动性币,
+  //   按"bars × intervalSec"算只能回溯到 12-13 小时前,那段时间币可能根本没交易 → 只返回少量K线。
+  //   改为:取「bars 根对应的窗口」和「HIST_LOOKBACK_SEC(默认 1 天)」二者较大值,确保有足够的
+  //   历史可供挑选,同时新币(上线不足 1 天)也不会受影响(Birdeye 只返回存在的数据)。
+  const HIST_LOOKBACK_SEC = parseInt(process.env.HIST_LOOKBACK_SEC || String(24 * 60 * 60), 10); // 默认 1 天
+  const barsWindowSec = intervalSec * (bars + 5);
+  const lookbackSec = Math.max(barsWindowSec, HIST_LOOKBACK_SEC);
+  const time_from = now - lookbackSec;
   const time_to   = now;
 
   const url = `${BASE}/defi/ohlcv?address=${address}&type=${type}&time_from=${time_from}&time_to=${time_to}`;
@@ -509,10 +517,15 @@ async function getOHLCV(address, intervalSec, bars = 150) {
 
     // 按时间升序排列，去掉最后一根（可能未收盘）
     candles.sort((a, b) => a.openTime - b.openTime);
-    const closed = candles.slice(0, -1); // 去掉最后一根未收盘K线
+    let closed = candles.slice(0, -1); // 去掉最后一根未收盘K线
 
-    logger.info('[Birdeye] getOHLCV %s type=%s 拉取 %d 根历史K线 (请求%d根)',
-      address.slice(0, 8) + '...', type, closed.length, bars);
+    // ★ V5-4 FIX: 如果返回的K线比请求多,只保留最近 bars 根(避免 RSI/EMA 计算太慢)
+    if (closed.length > bars) {
+      closed = closed.slice(-bars);
+    }
+
+    logger.info('[Birdeye] getOHLCV %s type=%s 拉取 %d 根历史K线 (请求%d根,回溯%dh)',
+      address.slice(0, 8) + '...', type, closed.length, bars, Math.round(lookbackSec / 3600));
     return closed;
   } catch (err) {
     logger.warn('[Birdeye] getOHLCV %s 失败: %s', address.slice(0, 8), err.message);
